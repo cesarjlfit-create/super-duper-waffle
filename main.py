@@ -2,8 +2,10 @@ import json
 import io
 import traceback
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Optional
+from datetime import datetime
 
 import qrcode
 import qrcode.image.pil
@@ -13,6 +15,9 @@ from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib import colors
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+from PIL import Image
+import pytesseract
+
 import config
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse
@@ -24,7 +29,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 supabase: Optional[Client] = None
-gemini_client: Optional[genai.Client] = None
 
 
 @asynccontextmanager
@@ -32,7 +36,7 @@ async def lifespan(app: FastAPI):
     global supabase
     try:
         supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-        logger.info("Serviços iniciados com sucesso.")
+        logger.info("Serviço do Supabase iniciado com sucesso.")
     except Exception as e:
         logger.error(f"Erro ao iniciar clientes: {e}")
     yield
@@ -52,12 +56,6 @@ def get_supabase() -> Client:
     if supabase is None:
         raise HTTPException(status_code=503, detail="Banco de dados indisponível.")
     return supabase
-
-
-def get_gemini() -> genai.Client:
-    if gemini_client is None:
-        raise HTTPException(status_code=503, detail="Serviço de IA indisponível.")
-    return gemini_client
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +166,7 @@ def atualizar_quantidade_item(body: AtualizarQuantidade, db: Client = Depends(ge
     if not resp.data:
         raise HTTPException(status_code=404, detail="Item não encontrado.")
     db.table("itens_palete").update({"quantidade": body.quantidade}).eq("id", body.id_item).execute()
-    return {"mensagem": f"Quantidade atualizada para {body.quantidade}."}
+    return {"mensagem": f"Quantidade updated para {body.quantidade}."}
 
 
 # ===========================================================================
@@ -176,16 +174,9 @@ def atualizar_quantidade_item(body: AtualizarQuantidade, db: Client = Depends(ge
 # ===========================================================================
 @app.get("/api/mapa", tags=["Mapa"])
 def mapa_armazem(db: Client = Depends(get_supabase)):
-    """
-    Retorna posições com:
-    - num_paletes: contagem de paletes na posição
-    - id_palete: ID do primeiro palete (para exibir na célula)
-    - disponivel: True se a posição não tiver nenhum palete
-    """
     resp_pos = db.table("posicoes_estoque").select("id, coluna, nivel, lado").execute()
     resp_paletes = db.table("paletes").select("posicao_id, id_palete").execute()
 
-    # Mapeia posicao_id → lista de paletes
     mapa: dict[int, list[int]] = {}
     for p in resp_paletes.data or []:
         pos_id = p["posicao_id"]
@@ -222,46 +213,69 @@ def itens_por_posicao(posicao_id: int, db: Client = Depends(get_supabase)):
 
 
 # ===========================================================================
-# RECEBIMENTO
+# RECEBIMENTO (MIGRADO PARA TESSERACT OCR)
 # ===========================================================================
 @app.post("/api/palete/escanear", tags=["Recebimento"])
-async def escanear_etiqueta(
-    file: UploadFile = File(...),
-    ai: genai.Client = Depends(get_gemini),
-):
-    """Lê a etiqueta com IA e devolve os dados extraídos SEM salvar no banco."""
+async def escanear_etiqueta(file: UploadFile = File(...)):
+    """Lê a etiqueta localmente com Tesseract OCR e devolve os dados extraídos."""
     try:
         file_bytes = await file.read()
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
 
-        prompt = (
-            "Analise esta etiqueta logística e extraia as informações em JSON com as chaves: "
-            "descricao, codigo_pa, lote, data_validade (formato YYYY-MM-DD), quantidade (inteiro, 0 se não encontrar). "
-            "Responda APENAS com o JSON."
-        )
-        response = ai.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                types.Part.from_bytes(data=file_bytes, mime_type=file.content_type or "image/jpeg"),
-                prompt,
-            ],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
-        try:
-            dados_ia = json.loads(raw_text)
-        except json.JSONDecodeError as e:
-            logger.error(f"Resposta inválida da IA: {raw_text}")
-            raise HTTPException(status_code=502, detail=f"IA retornou resposta inválida: {e}")
+        # Abre a imagem estruturada na memória
+        img = Image.open(io.BytesIO(file_bytes))
+        
+        # O Tesseract processa a imagem do rótulo
+        texto_extraido = pytesseract.image_to_string(img, lang='por')
+        
+        dados_finais = {
+            "descricao": "N/A",
+            "codigo_pa": "N/A",
+            "lote": "N/A",
+            "data_validade": "2099-01-01",
+            "quantidade": 0
+        }
 
-        return dados_ia
+        # 1. Regex de extração para o Lote (Procura L: ou LOTE:)
+        match_lote = re.search(r'(?i)(?:L:|LOTE\s*:?)\s*([A-Z0-9\-]+)', texto_extraido)
+        if match_lote:
+            dados_finais["lote"] = match_lote.group(1).strip()
 
-    except HTTPException:
-        raise
+        # 2. Regex de extração para a Quantidade (Procura QTD ou QTDE)
+        match_qtd = re.search(r'(?i)(?:QTDE|QTD)\s*:?\s*(\d+)', texto_extraido)
+        if match_qtd:
+            dados_finais["quantidade"] = int(match_qtd.group(1))
+
+        # 3. Regex de extração para Validade (Converte dd/mm/yyyy para o padrão ISO YYYY-MM-DD do Supabase)
+        match_val = re.search(r'(?i)(?:V:|VENC\s*:?|DATA\s*VENC\s*:?)\s*(\d{2}/\d{2}/\d{4})', texto_extraido)
+        if match_val:
+            data_str = match_val.group(1)
+            try:
+                dados_finais["data_validade"] = datetime.strptime(data_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+        # 4. Regex de extração para o Código PA (Padrão Fitoway PA + sequência numérica)
+        match_pa = re.search(r'(?i)(PA\d{5,12})', texto_extraido)
+        if match_pa:
+            dados_finais["codigo_pa"] = match_pa.group(1).upper()
+
+        # 5. Regex de extração para a Descrição (Procura a linha com WHEY ou PROTEIN)
+        match_desc = re.search(r'(?i)(.*(?:WHEY|PROTEIN|REFIL).*)', texto_extraido)
+        if match_desc:
+            dados_finais["descricao"] = match_desc.group(1).strip().upper()
+        else:
+            # Caso o OCR falhe nas palavras chaves, pega a primeira linha textual útil da etiqueta
+            linhas = [l.strip() for l in texto_extraido.split('\n') if l.strip()]
+            if linhas:
+                dados_finais["descricao"] = linhas[0].upper()
+
+        return dados_finais
+
     except Exception:
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Erro ao escanear etiqueta.")
+        raise HTTPException(status_code=500, detail="Erro interno no motor de leitura OCR.")
 
 
 @app.post("/api/palete/adicionar", tags=["Recebimento"])
@@ -269,10 +283,6 @@ async def adicionar_palete(
     body: AdicionarPaleteBody,
     db: Client = Depends(get_supabase),
 ):
-    """
-    Salva o palete e TODOS os seus itens (suporte a múltiplos produtos por palete).
-    O frontend já valida lotes duplicados antes de chamar este endpoint.
-    """
     try:
         coluna_limpa = body.coluna.strip().upper()
         lado_limpo = body.lado.strip().capitalize()
@@ -302,7 +312,7 @@ async def adicionar_palete(
                 .execute()
             )
             pos_dup = resp_pos_dup.data[0] if resp_pos_dup.data else {}
-            posicao_str = f"{pos_dup.get('coluna','?')}{pos_dup.get('nivel','?')}\ ({pos_dup.get('lado','?')})"
+            posicao_str = f"{pos_dup.get('coluna','?')}{pos_dup.get('nivel','?')} ({pos_dup.get('lado','?')})"
             raise HTTPException(
                 status_code=409,
                 detail=json.dumps({
@@ -347,7 +357,6 @@ async def adicionar_palete(
         raise HTTPException(status_code=500, detail="Erro interno. Verifique os logs.")
 
 
-
 # ===========================================================================
 # ADICIONAR ITENS A PALETE EXISTENTE
 # ===========================================================================
@@ -361,10 +370,6 @@ def adicionar_itens_palete(
     body: AdicionarItensBody,
     db: Client = Depends(get_supabase),
 ):
-    """
-    Adiciona novos itens a um palete já existente no armazém.
-    Usado quando o operador quer incluir produtos em um palete já alocado.
-    """
     resp_p = db.table("paletes").select("id_palete, posicao_id").eq("id_palete", id_palete).execute()
     if not resp_p.data:
         raise HTTPException(status_code=404, detail=f"Palete {id_palete} não encontrado.")
@@ -472,11 +477,10 @@ def exportar_inventario_excel(db: Client = Depends(get_supabase)):
 
 
 # ===========================================================================
-# ETIQUETA PDF — FIX 2: retorna dados do palete para exibir na tela de sucesso
+# DADOS DO PALETE E EMISSÃO DE ETIQUETA EM PDF (A6)
 # ===========================================================================
 @app.get("/api/palete/{id_palete}/dados", tags=["Recebimento"])
 def dados_palete(id_palete: int, db: Client = Depends(get_supabase)):
-    """Retorna dados completos do palete recém-criado (usado na tela de sucesso)."""
     resp_p = db.table("paletes").select("id_palete, posicao_id").eq("id_palete", id_palete).execute()
     if not resp_p.data:
         raise HTTPException(status_code=404, detail=f"Palete {id_palete} não encontrado.")
@@ -500,7 +504,6 @@ def dados_palete(id_palete: int, db: Client = Depends(get_supabase)):
 
 @app.get("/api/palete/{id_palete}/etiqueta", tags=["Recebimento"])
 def gerar_etiqueta(id_palete: int, db: Client = Depends(get_supabase)):
-    """Gera PDF A6 com QR code para impressão."""
     resp_p = db.table("paletes").select("id_palete, posicao_id").eq("id_palete", id_palete).execute()
     if not resp_p.data:
         raise HTTPException(status_code=404, detail=f"Palete {id_palete} não encontrado.")
@@ -516,7 +519,6 @@ def gerar_etiqueta(id_palete: int, db: Client = Depends(get_supabase)):
     resp_itens = db.table("itens_palete").select("*").eq("palete_id", id_palete).execute()
     itens = resp_itens.data or []
 
-    # Gera QR code
     qr = qrcode.QRCode(box_size=4, border=2)
     qr.add_data(str(id_palete))
     qr.make(fit=True)
@@ -531,7 +533,6 @@ def gerar_etiqueta(id_palete: int, db: Client = Depends(get_supabase)):
     c = rl_canvas.Canvas(buf, pagesize=A6)
     c.setTitle(f"Etiqueta Palete {id_palete}")
 
-    # Cabeçalho escuro
     c.setFillColor(colors.HexColor("#1e293b"))
     c.rect(0, H - 28*mm, W, 28*mm, fill=True, stroke=False)
     c.setFillColor(colors.HexColor("#facc15"))
@@ -541,12 +542,10 @@ def gerar_etiqueta(id_palete: int, db: Client = Depends(get_supabase)):
     c.setFillColor(colors.white)
     c.drawCentredString(W / 2, H - 19*mm, "ETIQUETA DE PALETE")
 
-    # Nº do palete
     c.setFillColor(colors.HexColor("#1e293b"))
     c.setFont("Helvetica-Bold", 28)
     c.drawCentredString(W / 2, H - 42*mm, f"#{id_palete}")
 
-    # Posição
     c.setFont("Helvetica-Bold", 10)
     c.setFillColor(colors.HexColor("#64748b"))
     c.drawCentredString(W / 2, H - 51*mm, "POSIÇÃO")
@@ -554,16 +553,13 @@ def gerar_etiqueta(id_palete: int, db: Client = Depends(get_supabase)):
     c.setFillColor(colors.HexColor("#0f172a"))
     c.drawCentredString(W / 2, H - 60*mm, posicao_str)
 
-    # QR code centralizado
     qr_size = 32*mm
     c.drawImage(qr_buf, (W - qr_size) / 2, H - 98*mm, width=qr_size, height=qr_size)
 
-    # Linha separadora
     c.setStrokeColor(colors.HexColor("#e2e8f0"))
     c.setLineWidth(0.5)
     c.line(8*mm, H - 101*mm, W - 8*mm, H - 101*mm)
 
-    # Lista de itens
     y = H - 108*mm
     c.setFont("Helvetica-Bold", 7)
     c.setFillColor(colors.HexColor("#64748b"))
@@ -623,4 +619,4 @@ def seed_posicoes(db: Client = Depends(get_supabase)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8080)
