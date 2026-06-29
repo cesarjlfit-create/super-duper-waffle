@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+supabase
+google-generativeai
+pandas
+openpyxl
+qrcode[pil]
+fpdf2
+pydantic
+openpyxl
