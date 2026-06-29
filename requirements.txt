@@ -1,12 +1,10 @@
 fastapi
 uvicorn
-python-multipart
 supabase
-google-generativeai
+python-multipart
+qrcode
 pandas
 openpyxl
-qrcode[pil]
-fpdf2
-pydantic
-openpyxl
 reportlab
+pytesseract
+Pillow
