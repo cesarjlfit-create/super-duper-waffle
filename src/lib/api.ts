@@ -2,7 +2,7 @@ import { QueryClient } from "@tanstack/react-query";
 
 export const queryClient = new QueryClient();
 
-const API_BASE = '/api';
+const API_BASE = 'https://super-duper-waffle-rypd.onrender.com/';
 
 export async function fetchApi(endpoint: string, options: RequestInit = {}) {
   const res = await fetch(`${API_BASE}${endpoint}`, {
