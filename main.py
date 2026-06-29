@@ -19,8 +19,6 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
-from google import genai
-from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,10 +29,9 @@ gemini_client: Optional[genai.Client] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supabase, gemini_client
+    global supabase
     try:
         supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
-        gemini_client = genai.Client(api_key=config.GEMINI_API_KEY)
         logger.info("Serviços iniciados com sucesso.")
     except Exception as e:
         logger.error(f"Erro ao iniciar clientes: {e}")
