@@ -9,3 +9,4 @@ qrcode[pil]
 fpdf2
 pydantic
 openpyxl
+reportlab
